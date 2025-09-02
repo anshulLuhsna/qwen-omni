@@ -44,7 +44,6 @@ SAMPLE_RATE = 24000  # 24kHz audio
 # Global model variables
 model = None
 processor = None
-tokenizer = None
 
 # Request/Response models
 class ChatRequest(BaseModel):
@@ -77,39 +76,23 @@ app.add_middleware(
 
 def load_model():
     """Load Qwen2.5-Omni-7B AWQ model with optimizations"""
-    global model, processor, tokenizer
+    global model, processor
     
     logger.info(f"Loading model: {MODEL_ID}")
     
     try:
-        from transformers import Qwen2OmniForConditionalGeneration, AutoTokenizer
-        from qwen_omni_utils import Qwen2_5OmniProcessor
-        
-        # Model loading arguments
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": "auto",
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": True,
-        }
-        
-        # Try flash attention 2 first
-        try:
-            import flash_attn
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Flash Attention 2 available, using optimized attention")
-        except ImportError:
-            logger.info("Flash Attention 2 not available, using standard attention")
+        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
         
         # Load model
-        model = Qwen2OmniForConditionalGeneration.from_pretrained(
+        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             MODEL_ID,
-            **model_kwargs
+            device_map="auto",
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            attn_implementation="sdpa",   # or "flash_attention_2" if it worked
         )
         
-        # Load processor and tokenizer
-        processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        # Load processor
+        processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-7B")
         
         # Set to eval mode
         model.eval()
@@ -156,7 +139,7 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Main chat endpoint for text and audio"""
-    global model, processor, tokenizer
+    global model, processor
     
     # Ensure model is loaded
     if model is None:
@@ -203,7 +186,7 @@ async def chat(request: ChatRequest):
             raise HTTPException(status_code=400, detail="No input provided")
         
         # Apply chat template
-        text = tokenizer.apply_chat_template(
+        text = processor.tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=True
@@ -231,13 +214,13 @@ async def chat(request: ChatRequest):
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
                 do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
             )
         
         # Decode text
         generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-        text_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        text_response = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
         # Generate audio from text response
         audio_response = generate_audio_from_text(text_response, request.voice)
@@ -263,7 +246,7 @@ async def chat(request: ChatRequest):
 
 def generate_audio_from_text(text: str, voice: str = "Cherry") -> np.ndarray:
     """Generate audio from text using Qwen's TTS capabilities"""
-    global model, processor, tokenizer
+    global model, processor
     
     try:
         # Prepare TTS prompt
@@ -272,7 +255,7 @@ def generate_audio_from_text(text: str, voice: str = "Cherry") -> np.ndarray:
             {"role": "user", "content": f"Please say: {text}"}
         ]
         
-        tts_text = tokenizer.apply_chat_template(
+        tts_text = processor.tokenizer.apply_chat_template(
             tts_messages,
             tokenize=False,
             add_generation_prompt=True
