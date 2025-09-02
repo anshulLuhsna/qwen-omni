@@ -1,0 +1,17 @@
+transformers==4.52.3
+autoawq==0.2.9
+accelerate
+qwen-omni-utils
+fastapi
+uvicorn
+pydantic<2
+soundfile
+librosa
+torch>=2.1.0
+huggingface-hub
+hf-transfer
+numpy<2
+scipy
+python-multipart
+aiofiles
+websockets
