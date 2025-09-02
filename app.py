@@ -4,7 +4,6 @@ Qwen2.5-Omni-7B AWQ FastAPI Server
 Serves text and audio chat with TTS capabilities
 """
 
-import os
 import sys
 import base64
 import logging
@@ -64,6 +63,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Serve frontend
+app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -72,10 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Mount static files for frontend
-if os.path.exists("frontend"):
-    app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
 
 def load_model():
     """Load Qwen2.5-Omni-7B AWQ model with optimizations"""
