@@ -90,14 +90,17 @@ def load_model():
             zero_point=True,
             version="gemv",   # safer than default
             backend="autoawq",
-            modules_to_not_convert=["talkers", "audio", "codec", "tts", "vocoder", "speech"]
+            modules_to_not_convert=[
+                "talkers", "audio", "codec", "code2wav",
+                "token2wav", "tts", "vocoder", "speech"
+            ],
         )
         
         # Load model
         model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             MODEL_ID,
             device_map="auto",
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.float16,   # AWQ kernels don't support bf16 yet
             attn_implementation="sdpa",   # or "flash_attention_2" if it worked
             quantization_config=awq_cfg,   # <-- add this
         )
