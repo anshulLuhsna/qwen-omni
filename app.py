@@ -81,7 +81,17 @@ def load_model():
     logger.info(f"Loading model: {MODEL_ID}")
     
     try:
-        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, AwqConfig
+        
+        # Configure AWQ quantization
+        awq_cfg = AwqConfig(
+            bits=4,
+            group_size=128,
+            zero_point=True,
+            version="gemv",   # safer than default
+            backend="autoawq",
+            modules_to_not_convert=["talkers", "audio", "codec", "tts", "vocoder", "speech"]
+        )
         
         # Load model
         model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -89,6 +99,7 @@ def load_model():
             device_map="auto",
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             attn_implementation="sdpa",   # or "flash_attention_2" if it worked
+            quantization_config=awq_cfg,   # <-- add this
         )
         
         # Load processor
