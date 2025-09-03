@@ -26,8 +26,7 @@ def smoke_test():
     # Import dependencies
     print(f"\n[2/4] Loading dependencies...")
     try:
-        from transformers import Qwen2OmniForConditionalGeneration, AutoTokenizer
-        from qwen_omni_utils import Qwen2_5OmniProcessor
+        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
         import soundfile as sf
         print("✓ All dependencies loaded")
     except ImportError as e:
@@ -39,31 +38,16 @@ def smoke_test():
     try:
         MODEL_ID = "Qwen/Qwen2.5-Omni-7B-AWQ"
         
-        # Model kwargs
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": "auto",
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": True,
-        }
-        
-        # Try flash attention
-        try:
-            import flash_attn
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            print("  Using Flash Attention 2")
-        except ImportError:
-            print("  Using standard attention")
-        
         # Load model
-        model = Qwen2OmniForConditionalGeneration.from_pretrained(
+        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             MODEL_ID,
-            **model_kwargs
+            device_map="auto",
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            attn_implementation="sdpa",   # or "flash_attention_2" if it worked
         )
         
-        # Load processor and tokenizer
-        processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        # Load processor
+        processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-7B")
         
         model.eval()
         print(f"✓ Model loaded successfully")
@@ -88,7 +72,7 @@ def smoke_test():
             {"role": "user", "content": test_text}
         ]
         
-        text = tokenizer.apply_chat_template(
+        text = processor.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
@@ -110,13 +94,13 @@ def smoke_test():
                 max_new_tokens=50,
                 temperature=0.7,
                 do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
             )
         
         # Decode response
         generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-        text_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        text_response = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
         print(f"✓ Inference successful")
         print(f"  Input: {test_text}")
