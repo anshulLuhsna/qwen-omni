@@ -84,31 +84,50 @@ if os.path.exists("frontend"):
 # Model loader
 # -------------------------
 def load_model():
-    """Load Qwen2.5-Omni-7B FP16"""
+    """Load Qwen2.5-Omni-7B model into /workspace/.cache"""
     global model, processor, tokenizer
+
     logger.info(f"Loading model: {MODEL_ID}")
 
     try:
         from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
+        model_kwargs = {
+            "torch_dtype": torch.float16,         # full precision fp16
+            "device_map": "auto",
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "cache_dir": "/workspace/.cache"      # <---- mount path
+        }
+
+        # Try flash attention 2 if installed
+        try:
+            import flash_attn
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Flash Attention 2 enabled")
+        except ImportError:
+            model_kwargs["attn_implementation"] = "sdpa"
+            logger.info("Using SDPA attention (flash_attn not found)")
+
+        # Load model
         model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            MODEL_ID,
-            device_map="auto",
-            torch_dtype=torch.float16,   # ✅ FP16
-            attn_implementation="sdpa",  # use PyTorch SDPA kernels
-            trust_remote_code=True
+            MODEL_ID, **model_kwargs
         )
-        processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
+
+        # Processor (tokenizer + audio)
+        processor = Qwen2_5OmniProcessor.from_pretrained(
+            MODEL_ID, cache_dir="/workspace/.cache"
+        )
         tokenizer = processor.tokenizer
 
         model.eval()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        logger.info("Model loaded successfully")
+        logger.info("✅ Model loaded successfully")
 
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+        logger.error(f"❌ Failed to load model: {e}")
         traceback.print_exc()
         raise
 
