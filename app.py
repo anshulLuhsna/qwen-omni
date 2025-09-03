@@ -1,288 +1,281 @@
 #!/usr/bin/env python3
 """
-Qwen2.5-Omni-7B FastAPI Server
-Serves text and audio chat with TTS capabilities
+Qwen2.5-Omni-7B FastAPI Server (non-quantized)
+- Text in -> Text + real speech (24 kHz) out
+- Uses official Qwen2.5-Omni Transformers API
 """
 
 import os
-
-# Force HF cache inside your mounted volume
-os.environ["HF_HOME"] = "/workspace/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/workspace/.cache/huggingface/transformers"
-
 import base64
 import logging
 import traceback
+from io import BytesIO
 from typing import Optional
-import torch
+
 import numpy as np
 import soundfile as sf
-from io import BytesIO
-
+import torch
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("app")
 
-# CUDA check
-if not torch.cuda.is_available():
-    logger.warning("CUDA not available! Running on CPU will be very slow.")
-else:
-    logger.info(f"CUDA available. Device: {torch.cuda.get_device_name(0)}")
+# -----------------------------------------------------------------------------
+# Hugging Face cache on the mounted volume (so weights persist)
+# -----------------------------------------------------------------------------
+HF_HOME = os.environ.get("HF_HOME", "/workspace/.cache/huggingface")
+os.environ["HF_HOME"] = HF_HOME
+os.makedirs(HF_HOME, exist_ok=True)
 
-# Model configuration
-MODEL_ID = "Qwen/Qwen2.5-Omni-7B"   # ✅ Full precision model
+# -----------------------------------------------------------------------------
+# Model config
+# -----------------------------------------------------------------------------
+MODEL_ID = "Qwen/Qwen2.5-Omni-7B"   # non-quantized
+SAMPLE_RATE = 24_000                # model outputs 24 kHz audio (per model card)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_NEW_TOKENS = 1024
 TEMPERATURE = 0.7
 TOP_P = 0.9
-SAMPLE_RATE = 24000  # 24 kHz audio
+
+logger.info("CUDA available? %s", torch.cuda.is_available())
+if torch.cuda.is_available():
+    logger.info("GPU: %s", torch.cuda.get_device_name(0))
 
 # Globals
 model = None
 processor = None
-tokenizer = None
 
-# API request/response models
+# -----------------------------------------------------------------------------
+# API types
+# -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     text: Optional[str] = Field(None, description="Text input")
-    audio_wav_base64: Optional[str] = Field(None, description="Base64 encoded WAV audio")
-    voice: str = Field("Cherry", description="Voice for TTS: Cherry, Ethan, Serena, Chelsie")
+    # optional: accept a base64 WAV from client in the future
+    audio_wav_base64: Optional[str] = Field(None, description="Optional user audio (WAV, base64)")
+    voice: str = Field("Cherry", description="Voice style hint (prompted via system message)")
 
 class ChatResponse(BaseModel):
     text: str
-    audio_wav_base64: str
+    audio_wav_base64: str  # 24 kHz mono WAV (PCM 16) in base64
 
+# -----------------------------------------------------------------------------
 # FastAPI app
-app = FastAPI(
-    title="Qwen2.5-Omni-7B API",
-    description="Text and audio chat with TTS",
-    version="1.0.0"
-)
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Qwen2.5-Omni-7B API",
+              description="Text → Text + Speech (24 kHz)",
+              version="1.0.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Optional static frontend
-if os.path.exists("frontend"):
+if os.path.isdir("frontend"):
     app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 
-# -------------------------
-# Model loader
-# -------------------------
+# -----------------------------------------------------------------------------
+# Model loader (official Transformers path)
+# -----------------------------------------------------------------------------
 def load_model():
-    """Load Qwen2.5-Omni-7B model into /workspace/.cache"""
-    global model, processor, tokenizer
+    """
+    Load non-quantized Qwen2.5-Omni-7B with the official processor.
+    Follows the model card pattern: Processor.apply_chat_template -> process_mm_info -> model.generate -> (text_ids, audio)
+    """
+    global model, processor
 
-    logger.info(f"Loading model: {MODEL_ID}")
+    if model is not None and processor is not None:
+        return
 
     try:
         from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+        from qwen_omni_utils import process_mm_info
 
-        model_kwargs = {
-            "torch_dtype": torch.float16,         # full precision fp16
-            "device_map": "auto",
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-            "cache_dir": "/workspace/.cache"      # <---- mount path
-        }
+        logger.info("Loading %s ...", MODEL_ID)
 
-        # Try flash attention 2 if installed
+        # Prefer FlashAttention2 if present, otherwise SDPA is fine.
+        attn_impl = None
         try:
-            import flash_attn
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Flash Attention 2 enabled")
-        except ImportError:
-            model_kwargs["attn_implementation"] = "sdpa"
-            logger.info("Using SDPA attention (flash_attn not found)")
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            logger.info("flash-attn detected: using flash_attention_2")
+        except Exception:
+            logger.info("flash-attn not available: using SDPA")
 
-        # Load model
         model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            MODEL_ID, **model_kwargs
+            MODEL_ID,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation=attn_impl,   # None -> SDPA; else FA2
         )
-
-        # Processor (tokenizer + audio)
-        processor = Qwen2_5OmniProcessor.from_pretrained(
-            MODEL_ID, cache_dir="/workspace/.cache"
-        )
-        tokenizer = processor.tokenizer
+        processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
 
         model.eval()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        logger.info("✅ Model loaded successfully")
+        logger.info("Model loaded successfully")
 
     except Exception as e:
-        logger.error(f"❌ Failed to load model: {e}")
+        logger.error("Failed to load model: %s", e)
         traceback.print_exc()
         raise
 
-# -------------------------
-# Helper: TTS system prompt
-# -------------------------
-def get_tts_system_message(voice: str = "Cherry") -> str:
-    voices = {"Cherry": "Cherry", "Ethan": "Ethan", "Serena": "Serena", "Chelsie": "Chelsie"}
-    selected = voices.get(voice, "Cherry")
-    return f"You are a helpful assistant with voice capabilities. Use the {selected} voice style."
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def _tts_system_message(voice: str) -> str:
+    # The model card doesn’t define a hard parameter for voice; we nudge via system prompt.
+    return (f"You are a helpful assistant with voice capabilities. "
+            f"When generating speech, use a natural '{voice}' voice style. "
+            f"Respond clearly and conversationally.")
 
-# -------------------------
-# Startup hook
-# -------------------------
+def _build_inputs(text_prompt: str):
+    """Builds inputs for text-only chat but via the official multimodal path."""
+    from qwen_omni_utils import process_mm_info  # local import to avoid top-level dep if unused
+    from transformers import Qwen2_5OmniProcessor
+
+    conversation = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": text_prompt}],
+        },
+        # Actual user text will be appended by caller as role=user
+    ]
+
+    # Convert to model text & (empty) multimodal structures
+    chat_text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+
+    # Build tensor inputs; even for pure text we pass the multimodal kwargs (they’ll be empty lists)
+    inputs = processor(
+        text=chat_text,
+        audio=audios, images=images, videos=videos,
+        return_tensors="pt", padding=True, use_audio_in_video=False
+    )
+    return inputs.to(model.device).to(model.dtype)
+
+def _gen_speech_from_messages(messages: list):
+    """
+    messages: chat turns as dicts with 'role' and 'content' (list of {'type','text'} etc.)
+    Returns: (text_out, audio_numpy)
+    """
+    from qwen_omni_utils import process_mm_info
+
+    # Template → tensors (official path)
+    text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
+
+    inputs = processor(
+        text=text, audio=audios, images=images, videos=videos,
+        return_tensors="pt", padding=True, use_audio_in_video=False
+    ).to(model.device).to(model.dtype)
+
+    # The official API returns (text_ids, audio)
+    # See model card “Transformers Usage”. :contentReference[oaicite:1]{index=1}
+    text_ids, audio = model.generate(**inputs)
+
+    # Decode text
+    text_out = processor.batch_decode(text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+    # Audio → numpy (24 kHz per model card) :contentReference[oaicite:2]{index=2}
+    audio_np = audio.reshape(-1).detach().cpu().numpy()
+    return text_out, audio_np
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
-async def startup_event():
+async def _startup():
     try:
         load_model()
     except Exception as e:
-        logger.error(f"Startup model load failed: {e}")
+        logger.error("Startup load failed: %s", e)
 
 @app.get("/healthz")
-async def health_check():
+async def healthz():
     return {"ok": True}
 
-# -------------------------
-# Main chat endpoint
-# -------------------------
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    global model, processor, tokenizer
+async def chat(req: ChatRequest):
+    """
+    Text → Text + Speech (WAV@24kHz base64).
+    """
+    global model, processor
     if model is None:
-        load_model()
+        try:
+            load_model()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Model loading failed: {e}")
+
+    if not req.text and not req.audio_wav_base64:
+        raise HTTPException(status_code=400, detail="Provide 'text' or 'audio_wav_base64'.")
 
     try:
-        text_input = request.text or ""
-        audio_input = None
-
-        # Handle audio input
-        if request.audio_wav_base64:
-            try:
-                audio_bytes = base64.b64decode(request.audio_wav_base64)
-                audio_input = BytesIO(audio_bytes)
-                audio_data, sr = sf.read(audio_input)
-                if sr != SAMPLE_RATE:
-                    import librosa
-                    audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=SAMPLE_RATE)
-            except Exception as e:
-                logger.error(f"Audio error: {e}")
-                raise HTTPException(status_code=400, detail="Invalid audio data")
-
-        # Conversation prompt
-        system_msg = get_tts_system_message(request.voice)
-        messages = [{"role": "system", "content": system_msg}]
-        if text_input:
-            messages.append({"role": "user", "content": text_input})
-        elif audio_input is not None:
-            messages.append({"role": "user", "content": "Process audio input"})
+        # Build conversation
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": _tts_system_message(req.voice)}]},
+        ]
+        if req.text:
+            messages.append({"role": "user", "content": [{"type": "text", "text": req.text}]})
         else:
-            raise HTTPException(status_code=400, detail="No input provided")
+            # (Optional) handle user audio in future — current path is text→speech
+            messages.append({"role": "user", "content": [{"type": "text", "text": "(User sent audio)"}]})
 
-        # Apply chat template
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_out, audio_np = _gen_speech_from_messages(messages)
 
-        # Inputs
-        if audio_input is not None:
-            inputs = processor(text=text, audios=[audio_data], sampling_rate=SAMPLE_RATE,
-                               return_tensors="pt").to(DEVICE)
-        else:
-            inputs = processor(text=text, return_tensors="pt").to(DEVICE)
-
-        # Generate response
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        # Decode
-        generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-        text_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-        # Generate audio (placeholder sine wave for now)
-        audio_response = generate_audio_from_text(text_response, request.voice)
+        # Encode WAV (PCM_16) at 24kHz
         buf = BytesIO()
-        sf.write(buf, audio_response, SAMPLE_RATE, format="WAV", subtype="PCM_16")
-        audio_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        sf.write(buf, audio_np, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return ChatResponse(text=text_response, audio_wav_base64=audio_base64)
+        return ChatResponse(text=text_out, audio_wav_base64=audio_b64)
 
+    except torch.cuda.OutOfMemoryError:
+        raise HTTPException(status_code=507, detail="CUDA OOM. Reduce max_new_tokens or free VRAM.")
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error("Chat error: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------------
-# Dummy TTS generator
-# -------------------------
-def generate_audio_from_text(text: str, voice: str = "Cherry") -> np.ndarray:
-    try:
-        duration = min(len(text.split()) * 0.5, 10)
-        samples = int(duration * SAMPLE_RATE)
-        t = np.linspace(0, duration, samples)
-        freq = 440
-        audio = 0.3 * np.sin(2 * np.pi * freq * t)
-
-        for i, char in enumerate(text[:20]):
-            freq_mod = 440 + (ord(char) % 12) * 20
-            audio += 0.1 * np.sin(2 * np.pi * freq_mod * t)
-
-        audio = audio / np.max(np.abs(audio))
-        return audio.astype(np.float32)
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        return np.zeros(SAMPLE_RATE, dtype=np.float32)
-
-# -------------------------
-# WebSocket endpoint
-# -------------------------
 @app.websocket("/ws_chat")
-async def websocket_chat(websocket: WebSocket):
-    await websocket.accept()
+async def ws_chat(ws: WebSocket):
+    await ws.accept()
     try:
         while True:
-            data = await websocket.receive_json()
-            request = ChatRequest(**data)
-            response = await chat(request)
-            await websocket.send_json({"text": response.text, "audio_wav_base64": response.audio_wav_base64})
+            data = await ws.receive_json()
+            req = ChatRequest(**data)
+            resp = await chat(req)
+            await ws.send_json(resp.dict())
     except Exception as e:
-        logger.error(f"WS error: {e}")
-        await websocket.close()
+        logger.error("WebSocket error: %s", e)
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 @app.get("/")
 async def root():
     return {
         "name": "Qwen2.5-Omni-7B API",
-        "version": "1.0.0",
-        "endpoints": {
-            "health": "/healthz",
-            "chat": "/chat",
-            "frontend": "/frontend/",
-            "websocket": "/ws_chat",
-        },
+        "endpoints": {"health": "/healthz", "chat": "/chat", "ws": "/ws_chat", "frontend": "/frontend/"},
         "model": MODEL_ID,
         "device": DEVICE,
+        "sr_hz": SAMPLE_RATE,
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    # Run on 8888 if you exposed that port in RunPod
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8888")), workers=1)
