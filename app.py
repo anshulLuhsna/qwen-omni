@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Qwen2.5-Omni-7B AWQ FastAPI Server
+Qwen2.5-Omni-7B FastAPI Server
 Serves text and audio chat with TTS capabilities
 """
 
 import os
-import sys
 import base64
 import logging
 import traceback
@@ -17,214 +16,165 @@ from io import BytesIO
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Check CUDA availability
+# CUDA check
 if not torch.cuda.is_available():
     logger.warning("CUDA not available! Running on CPU will be very slow.")
 else:
     logger.info(f"CUDA available. Device: {torch.cuda.get_device_name(0)}")
 
 # Model configuration
-MODEL_ID = "Qwen/Qwen2.5-Omni-7B-AWQ"
+MODEL_ID = "Qwen/Qwen2.5-Omni-7B"   # ✅ Full precision model
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_NEW_TOKENS = 1024
 TEMPERATURE = 0.7
 TOP_P = 0.9
-SAMPLE_RATE = 24000  # 24kHz audio
+SAMPLE_RATE = 24000  # 24 kHz audio
 
-# Global model variables
+# Globals
 model = None
 processor = None
 tokenizer = None
 
-# Request/Response models
+# API request/response models
 class ChatRequest(BaseModel):
     text: Optional[str] = Field(None, description="Text input")
     audio_wav_base64: Optional[str] = Field(None, description="Base64 encoded WAV audio")
-    voice: str = Field("Cherry", description="Voice for TTS: Cherry, Ethan, Serena, or Chelsie")
+    voice: str = Field("Cherry", description="Voice for TTS: Cherry, Ethan, Serena, Chelsie")
 
 class ChatResponse(BaseModel):
     text: str
     audio_wav_base64: str
 
-# Initialize FastAPI app
+# FastAPI app
 app = FastAPI(
-    title="Qwen2.5-Omni-7B AWQ API",
+    title="Qwen2.5-Omni-7B API",
     description="Text and audio chat with TTS",
     version="1.0.0"
 )
 
-# Configure CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Open for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mount static files for frontend
+# Optional static frontend
 if os.path.exists("frontend"):
-    app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
+    app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 
+# -------------------------
+# Model loader
+# -------------------------
 def load_model():
-    """Load Qwen2.5-Omni-7B AWQ model with optimizations"""
+    """Load Qwen2.5-Omni-7B FP16"""
     global model, processor, tokenizer
-    
     logger.info(f"Loading model: {MODEL_ID}")
-    
+
     try:
-        from transformers import Qwen2OmniForConditionalGeneration, AutoTokenizer
-        from qwen_omni_utils import Qwen2_5OmniProcessor
-        
-        # Model loading arguments
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": "auto",
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": True,
-        }
-        
-        # Try flash attention 2 first
-        try:
-            import flash_attn
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Flash Attention 2 available, using optimized attention")
-        except ImportError:
-            logger.info("Flash Attention 2 not available, using standard attention")
-        
-        # Load model
-        model = Qwen2OmniForConditionalGeneration.from_pretrained(
+        from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
+
+        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
             MODEL_ID,
-            **model_kwargs
+            device_map="auto",
+            torch_dtype=torch.float16,   # ✅ FP16
+            attn_implementation="sdpa",  # use PyTorch SDPA kernels
+            trust_remote_code=True
         )
-        
-        # Load processor and tokenizer
         processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_ID)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        
-        # Set to eval mode
+        tokenizer = processor.tokenizer
+
         model.eval()
-        
-        # Clear cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
+
         logger.info("Model loaded successfully")
-        
+
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         traceback.print_exc()
         raise
 
+# -------------------------
+# Helper: TTS system prompt
+# -------------------------
 def get_tts_system_message(voice: str = "Cherry") -> str:
-    """Get system message for TTS voice selection"""
-    voice_map = {
-        "Cherry": "Cherry",
-        "Ethan": "Ethan", 
-        "Serena": "Serena",
-        "Chelsie": "Chelsie"
-    }
-    
-    selected_voice = voice_map.get(voice, "Cherry")
-    
-    return f"""You are a helpful assistant with voice capabilities. 
-When generating speech, use the {selected_voice} voice style.
-Respond naturally and conversationally."""
+    voices = {"Cherry": "Cherry", "Ethan": "Ethan", "Serena": "Serena", "Chelsie": "Chelsie"}
+    selected = voices.get(voice, "Cherry")
+    return f"You are a helpful assistant with voice capabilities. Use the {selected} voice style."
 
+# -------------------------
+# Startup hook
+# -------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup"""
     try:
         load_model()
     except Exception as e:
-        logger.error(f"Failed to load model on startup: {e}")
+        logger.error(f"Startup model load failed: {e}")
 
 @app.get("/healthz")
 async def health_check():
-    """Health check endpoint"""
     return {"ok": True}
 
+# -------------------------
+# Main chat endpoint
+# -------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Main chat endpoint for text and audio"""
     global model, processor, tokenizer
-    
-    # Ensure model is loaded
     if model is None:
-        try:
-            load_model()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
-    
+        load_model()
+
     try:
-        # Prepare inputs
         text_input = request.text or ""
         audio_input = None
-        
-        # Handle audio input if provided
+
+        # Handle audio input
         if request.audio_wav_base64:
             try:
                 audio_bytes = base64.b64decode(request.audio_wav_base64)
                 audio_input = BytesIO(audio_bytes)
-                # Read audio with soundfile
                 audio_data, sr = sf.read(audio_input)
-                # Resample to 24kHz if needed
                 if sr != SAMPLE_RATE:
                     import librosa
                     audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=SAMPLE_RATE)
             except Exception as e:
-                logger.error(f"Audio processing error: {e}")
+                logger.error(f"Audio error: {e}")
                 raise HTTPException(status_code=400, detail="Invalid audio data")
-        
-        # Build conversation with system message for TTS
+
+        # Conversation prompt
         system_msg = get_tts_system_message(request.voice)
-        
-        # Prepare messages
-        messages = [
-            {"role": "system", "content": system_msg}
-        ]
-        
-        # Add user message
+        messages = [{"role": "system", "content": system_msg}]
         if text_input:
             messages.append({"role": "user", "content": text_input})
-        elif audio_input:
-            # Process audio input through model
+        elif audio_input is not None:
             messages.append({"role": "user", "content": "Process audio input"})
         else:
             raise HTTPException(status_code=400, detail="No input provided")
-        
+
         # Apply chat template
-        text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-        
-        # Process inputs
-        if audio_input:
-            inputs = processor(
-                text=text,
-                audios=[audio_data],
-                sampling_rate=SAMPLE_RATE,
-                return_tensors="pt"
-            ).to(DEVICE)
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        # Inputs
+        if audio_input is not None:
+            inputs = processor(text=text, audios=[audio_data], sampling_rate=SAMPLE_RATE,
+                               return_tensors="pt").to(DEVICE)
         else:
-            inputs = processor(
-                text=text,
-                return_tensors="pt"
-            ).to(DEVICE)
-        
+            inputs = processor(text=text, return_tensors="pt").to(DEVICE)
+
         # Generate response
         with torch.no_grad():
             outputs = model.generate(
@@ -236,130 +186,77 @@ async def chat(request: ChatRequest):
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-        
-        # Decode text
+
+        # Decode
         generated_ids = outputs[0][inputs.input_ids.shape[1]:]
         text_response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        # Generate audio from text response
+
+        # Generate audio (placeholder sine wave for now)
         audio_response = generate_audio_from_text(text_response, request.voice)
-        
-        # Encode audio to base64
-        audio_buffer = BytesIO()
-        sf.write(audio_buffer, audio_response, SAMPLE_RATE, format='WAV', subtype='PCM_16')
-        audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
-        
-        # Clear cache
+        buf = BytesIO()
+        sf.write(buf, audio_response, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        audio_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        return ChatResponse(
-            text=text_response,
-            audio_wav_base64=audio_base64
-        )
-        
+
+        return ChatResponse(text=text_response, audio_wav_base64=audio_base64)
+
     except Exception as e:
         logger.error(f"Chat error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# -------------------------
+# Dummy TTS generator
+# -------------------------
 def generate_audio_from_text(text: str, voice: str = "Cherry") -> np.ndarray:
-    """Generate audio from text using Qwen's TTS capabilities"""
-    global model, processor, tokenizer
-    
     try:
-        # Prepare TTS prompt
-        tts_messages = [
-            {"role": "system", "content": get_tts_system_message(voice)},
-            {"role": "user", "content": f"Please say: {text}"}
-        ]
-        
-        tts_text = tokenizer.apply_chat_template(
-            tts_messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        # Process for TTS
-        inputs = processor(
-            text=tts_text,
-            return_tensors="pt"
-        ).to(DEVICE)
-        
-        # Generate audio
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,  # Shorter for audio
-                return_dict_in_generate=True,
-                output_hidden_states=True
-            )
-        
-        # Extract audio from model outputs
-        # Note: This is a simplified version, actual implementation depends on model
-        # For now, generate placeholder audio
-        duration = min(len(text.split()) * 0.5, 10)  # Estimate duration
+        duration = min(len(text.split()) * 0.5, 10)
         samples = int(duration * SAMPLE_RATE)
-        
-        # Generate simple sine wave as placeholder
-        # In production, extract actual audio from model outputs
         t = np.linspace(0, duration, samples)
-        frequency = 440  # A4 note
-        audio = 0.3 * np.sin(2 * np.pi * frequency * t)
-        
-        # Add some variation based on text
+        freq = 440
+        audio = 0.3 * np.sin(2 * np.pi * freq * t)
+
         for i, char in enumerate(text[:20]):
             freq_mod = 440 + (ord(char) % 12) * 20
             audio += 0.1 * np.sin(2 * np.pi * freq_mod * t)
-        
-        # Normalize
+
         audio = audio / np.max(np.abs(audio))
-        
         return audio.astype(np.float32)
-        
     except Exception as e:
-        logger.error(f"TTS generation error: {e}")
-        # Return silence on error
+        logger.error(f"TTS error: {e}")
         return np.zeros(SAMPLE_RATE, dtype=np.float32)
 
+# -------------------------
+# WebSocket endpoint
+# -------------------------
 @app.websocket("/ws_chat")
 async def websocket_chat(websocket: WebSocket):
-    """WebSocket endpoint for streaming chat"""
     await websocket.accept()
-    
     try:
         while True:
-            # Receive data
             data = await websocket.receive_json()
-            
-            # Process through chat
             request = ChatRequest(**data)
             response = await chat(request)
-            
-            # Send response
-            await websocket.send_json({
-                "text": response.text,
-                "audio_wav_base64": response.audio_wav_base64
-            })
-            
+            await websocket.send_json({"text": response.text, "audio_wav_base64": response.audio_wav_base64})
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WS error: {e}")
         await websocket.close()
 
 @app.get("/")
 async def root():
-    """Root endpoint with API information"""
     return {
-        "name": "Qwen2.5-Omni-7B AWQ API",
+        "name": "Qwen2.5-Omni-7B API",
         "version": "1.0.0",
         "endpoints": {
             "health": "/healthz",
             "chat": "/chat",
             "frontend": "/frontend/",
-            "websocket": "/ws_chat"
+            "websocket": "/ws_chat",
         },
         "model": MODEL_ID,
-        "device": DEVICE
+        "device": DEVICE,
     }
 
 if __name__ == "__main__":
