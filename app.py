@@ -5,6 +5,11 @@ Serves text and audio chat with TTS capabilities
 """
 
 import os
+
+# Force HF cache inside your mounted volume
+os.environ["HF_HOME"] = "/workspace/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/workspace/.cache/huggingface/transformers"
+
 import base64
 import logging
 import traceback
